@@ -23,17 +23,6 @@ type PactRequest<'a> = {
     ResponseSpec : 'a -> string
 }
 
-type PactSerializer<'a> = {
-    ToJson : 'a -> JsonValue
-    FromJson : JsonValue -> 'a
-}
-
-type FieldMap<'a, 'b> = {
-    Key : string
-    Getter : 'a -> JsonValue
-    Setter: JsonValue -> 'b
-}
-
 type Iso<'a,'b> = Iso of ('a -> 'b option) * ('b -> 'a option)
 
 [<CompilationRepresentation(CompilationRepresentationFlags.ModuleSuffix)>]
@@ -153,50 +142,10 @@ module Iso =
         compose o2  t2 
 
 module PactSerializer = 
-    let intGetter n =
-        JsonValue.Number (decimal n)
-
-    let intSetter = function 
-        | JsonValue.Number s -> int s 
-        | _ -> failwith "number expected"
-
-    let intField key getter = 
-        { Key = key; Getter = getter >> intGetter; Setter = intSetter }
-
-    let stringGetter s = JsonValue.String s
-
-    let stringSetter = function
-        | JsonValue.String s -> s
-        | _ -> failwith "string expected"
-
-    let stringField key getter = 
-        { Key = key; Getter = getter >> stringGetter; Setter = stringSetter }
-
     let personIso : Iso<Person, JsonValue> =
         let id = Iso.withKey "id" Iso.intIso
         let name = Iso.withKey "name" Iso.stringIso
         Iso.buildIso2 Person.Create (fun (p:Person) -> (p.Id, p.Name)) id name
-
-    let map2 toObject (fieldMap1 : FieldMap<'a,'b>) (fieldMap2 : FieldMap<'a,'c>) =
-        let toJson a = 
-            let k1 = fieldMap1.Key
-            let v1 = fieldMap1.Getter a
-            let k2 = fieldMap2.Key
-            let v2 = fieldMap2.Getter a
-            JsonValue.Record [|(k1,v1); (k2,v2)|]
-        let fromJson jValue = 
-            match jValue with 
-            | JsonValue.Record properties ->
-                let properties = properties |> Map.ofArray
-                let f1 = fieldMap1.Setter <| properties.Item fieldMap1.Key
-                let f2 = fieldMap2.Setter <| properties.Item fieldMap2.Key
-                toObject f1 f2
-            | _ -> failwith "expecting a record"
-            
-        {
-            ToJson = toJson
-            FromJson = fromJson
-        }
 
 module ApiClient =
     let getPerson () = 
@@ -250,12 +199,6 @@ module PactTest =
 
     open PactSerializer
 
-    let personSerializer = 
-        map2 
-            Person.Create 
-            (intField "id" (fun p -> p.Id))
-            (stringField "name" (fun p -> p.Name))
-
     let reverseJson json =
         let out = Iso.unapply personIso json
         out
@@ -267,14 +210,6 @@ module PactTest =
             |> Option.bind reverseJson
 
         result =? Some person
-
-    [<Property>]
-    let ``Can round trip person`` person =
-        let result = 
-            personSerializer.ToJson person
-            |> personSerializer.FromJson
-
-        person =? result
 
     let personResponseIso : Iso<Person option, Response> = 
         let personToResponse = function
