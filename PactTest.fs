@@ -4,24 +4,73 @@ open Xunit
 open FsCheck.Xunit
 open FSharp.Data
 open Swensen.Unquote
+open Fleece
+open Fleece.Operators
+
+type PactRequest = {
+    Method : string
+    Path : string
+    Headers : Map<string, string>
+    Body : JsonValue option }
+with 
+ static member ToJSON (x: PactRequest) =
+    seq {
+        yield "method" .= x.Method
+        yield "path" .= x.Path
+        yield "headers" .= x.Headers
+    
+        match x.Body with
+        | Some b -> yield ("body", b)
+        | None -> ()
+    } |> jobj
+
+type PactResponse = {
+    Status : int
+    Headers : Map<string, string>
+    Body : JsonValue option }
+with 
+ static member ToJSON (x: PactResponse) =
+    seq {
+        yield "status" .= x.Status
+        yield "headers" .= x.Headers
+    
+        match x.Body with
+        | Some b -> yield ("body", b)
+        | None -> ()
+    } |> jobj
+
+type PactInteraction = {
+    Description : string
+    ProviderState : string
+    Request : PactRequest
+    Response : PactResponse }
+with 
+ static member ToJSON (x: PactInteraction) =
+    seq {
+        yield "description" .= x.Description
+        yield "provider_state" .= x.ProviderState
+        yield "request" .= x.Request
+        yield "response" .= x.Response
+    } |> jobj
+
+type PactSpec = {
+    Provider : string
+    Consumer : string
+    Interactions : PactInteraction list
+}
+with 
+ static member ToJSON (x: PactSpec) =
+    seq {
+        yield "provider" .= x.Provider
+        yield "consumer" .= x.Consumer
+        yield "Interactions" .= x.Interactions
+    } |> jobj
 
 type Person = {
     Id : int
     Name : string
 }
     with static member Create id name = { Person.Id = id; Name = name }
-
-type Response = {
-    StatusCode : int
-    Body : JsonValue
-}
-
-type PactRequest<'a> = {
-    Path : string
-    Method : string
-    RequestBody : string option
-    ResponseSpec : 'a -> string
-}
 
 type Iso<'a,'b> = Iso of ('a -> 'b option) * ('b -> 'a option)
 
@@ -141,63 +190,53 @@ module Iso =
         let o2 : Iso<'a,('x * 'y)> = tuple2Iso toObject fromObject
         compose o2  t2 
 
-module PactSerializer = 
+module ApiClient =
     let personIso : Iso<Person, JsonValue> =
         let id = Iso.withKey "id" Iso.intIso
         let name = Iso.withKey "name" Iso.stringIso
         Iso.buildIso2 Person.Create (fun (p:Person) -> (p.Id, p.Name)) id name
 
-module ApiClient =
-    let getPerson () = 
-        let responseSpec (person : Person) =
-            sprintf 
-                "{\n\  
-                     \"id\": %d,
-                     \"name\": %s
-                 }"
-                 person.Id
-                 person.Name
+    let personResponseIso : Iso<Person option, PactResponse> = 
+        let personToResponse = function
+            | Some p -> 
+                Iso.apply personIso p 
+                |> Option.map (fun p -> { PactResponse.Status = 200; Body = Some p; Headers = [("Content-Type", "application/json")] |> Map.ofSeq  })
+            | None -> Some { PactResponse.Status = 500; Body = None; Headers = Map.empty }
+        let responseToPerson = function
+            | r when r.Status = 500 ->
+                Some None
+            | r -> 
+                r.Body
+                |> Option.bind (fun b -> Some <| Iso.unapply personIso b)
+        Iso (personToResponse, responseToPerson)
 
-        { PactRequest.Path = "/person"
-          Method = "get"
-          RequestBody = None
-          ResponseSpec = responseSpec }
+    let getPerson () = 
+        let request = 
+            { PactRequest.Path = "/person"
+              Method = "GET"
+              Body = None
+              Headers = [("Accept", "application/json")] |> Map.ofSeq }
+        (request, personResponseIso)
 
 module PactTest = 
-
-    let pact 
+    let interaction 
         (name : string) 
-        (provider_state: string)
-        (request : PactRequest<'a>) 
-        (code : int) 
+        (providerState: string)
+        (request : PactRequest) 
+        (iso : Iso<'a, PactResponse>)
         (result : 'a) =
-           sprintf
-            "{
-              \"description\": \"%s\",
-              \"provider_state\": \"%s\",
-              \"request\": {
-                \"method\": \"get\",
-                \"path\": \"/alligators/Mary\",
-                \"headers\": {
-                  \"Accept\": \"application/json\"
-                }
-              },
-              \"response\": {
-                \"status\": 500,
-                \"headers\": {
-                  \"Content-Type\": \"application/json;charset=utf-8\"
-                },
-                \"body\": {
-                  \"error\": \"Argh!!!\"
-                }
-              }
-             }"
-            name
-            provider_state
+            match result |> Iso.apply iso with
+            | Some response -> 
+               { PactInteraction.Description = name
+                 ProviderState = providerState
+                 Request = request 
+                 Response = response }
+            | None ->
+                failwith "Could not map result to pact response"
 
     let andrew = { Id = 1; Name = "Andrew Browne" }
 
-    open PactSerializer
+    open ApiClient
 
     let reverseJson json =
         let out = Iso.unapply personIso json
@@ -211,59 +250,93 @@ module PactTest =
 
         result =? Some person
 
-    let personResponseIso : Iso<Person option, Response> = 
-        let personToResponse = function
-            | Some p -> 
-                Iso.apply personIso p 
-                |> Option.map (fun p -> { Response.StatusCode = 200; Body = p })
-            | None -> Some { Response.StatusCode = 500; Body = JsonValue.Null }
-        let responseToPerson = function
-            | r when r.StatusCode = 500 ->
-                Some None
-            | r -> 
-                Some <| Iso.unapply personIso r.Body
-
-        Iso (personToResponse, responseToPerson)
-
     [<Fact>]
     let ``Can map person to Response`` () =
         let response = Iso.apply personResponseIso (Some andrew)
 
-        response |> Option.map (fun r -> r.StatusCode) =? Some 200
+        response |> Option.map (fun r -> r.Status) =? Some 200
 
     [<Fact>]
     let ``Can write basic pact test`` () =  
-        let request = ApiClient.getPerson()
+        let (request, iso) = ApiClient.getPerson()
 
         let expected = 
-            FSharp.Data.JsonValue.Parse
-                "{
-                  \"description\": \"a request for a person\",
-                  \"provider_state\": \"Andrew is the man\",
-                  \"request\": {
-                    \"method\": \"get\",
-                    \"path\": \"/alligators/Mary\",
-                    \"headers\": {
-                      \"Accept\": \"application/json\"
-                    }
-                  },
-                  \"response\": {
-                    \"status\": 500,
-                    \"headers\": {
-                      \"Content-Type\": \"application/json;charset=utf-8\"
-                    },
-                    \"body\": {
-                      \"error\": \"Argh!!!\"
-                    }
-                  }
-                 }"
-        let p = 
-            FSharp.Data.JsonValue.Parse
-                (pact 
-                    "a request for a person"
-                    "Andrew is the man"
-                    request 
-                    200 
-                    andrew)
+            { PactInteraction.Description = "a request for a person" 
+              ProviderState = "Andrew is the man"
+              Request = 
+                { Path = "/person"
+                  Method = "GET"
+                  Body = None
+                  Headers = [("Accept", "application/json")] |> Map.ofSeq }
+              Response = 
+                { Status = 200
+                  Headers = Map.empty
+                  Body = Some <| JsonValue.Record [|("id", JsonValue.Number (decimal andrew.Id)); ("name", JsonValue.String andrew.Name)|]
+                }}
 
-        Assert.Equal(expected, p)
+        let p = 
+            (interaction 
+                "a request for a person"
+                "Andrew is the man"
+                request 
+                iso
+                (Some andrew))
+
+        expected =? p
+
+    open PactNet
+    open PactNet.Mocks.MockHttpService.Models
+    open HttpClient
+
+    let port = 1234
+    let buildPact (pactSpec : PactSpec) = 
+        let pact = 
+            (new PactBuilder()).ServiceConsumer(pactSpec.Consumer).HasPactWith(pactSpec.Provider)
+
+        let mockProviderService = pact.MockService(1234)
+
+        for interaction in pactSpec.Interactions do
+            let request = 
+                new ProviderServiceRequest(
+                    Method = HttpVerb.Get, 
+                    Path = interaction.Request.Path)
+            let response = 
+                new ProviderServiceResponse(
+                    Status = 200,
+                    Body = new obj(),
+                    Headers = new System.Collections.Generic.Dictionary<string,string>())
+            for responseHeader in interaction.Response.Headers do
+                response.Headers.Add(responseHeader.Key, responseHeader.Value)
+                
+            mockProviderService.Given(interaction.ProviderState).UponReceiving(interaction.Description)
+             .With(request)
+             .WillRespondWith(response)
+            |> ignore
+        mockProviderService
+        
+    [<Fact>]
+    let ``blah`` () =
+        let (request, iso) = ApiClient.getPerson()
+ 
+        let personRequest = 
+            (interaction 
+                "a request for a person"
+                "Andrew is the man"
+                request 
+                iso
+                (Some andrew))
+        let pactSpec = 
+            { PactSpec.Consumer = "A consumer"
+              Provider = "A provider"
+              Interactions = [personRequest] }
+        let mockProviderService = buildPact pactSpec
+        let basePath = sprintf "http://localhost:%d" port
+        
+        let realRequest =
+            createRequest Get (basePath + request.Path)
+            // |> withBody (request.Body.ToString())
+        
+        let response = realRequest |> getResponse
+
+        mockProviderService.VerifyInteractions()
+        ()
